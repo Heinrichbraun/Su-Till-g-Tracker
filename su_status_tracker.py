@@ -20,9 +20,13 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
+
+# GitHub-serverne kører i UTC, så vi angiver dansk tid eksplicit
+TZ = ZoneInfo("Europe/Copenhagen")
 
 URL = "https://www.su.dk/handicaptillaeg/status-paa-behandling-af-sager-handicaptillaeg"
 
@@ -128,7 +132,7 @@ def gem_snapshot(html: str) -> Path:
     begynder at fejle.
     """
     SNAPSHOT_DIR.mkdir(exist_ok=True)
-    filnavn = datetime.now().strftime("%Y-%m-%d_%H%M") + ".html"
+    filnavn = datetime.now(TZ).strftime("%Y-%m-%d_%H%M") + ".html"
     sti = SNAPSHOT_DIR / filnavn
     sti.write_text(html, encoding="utf-8")
     return sti
@@ -139,7 +143,7 @@ def hent_data() -> dict:
     gem_snapshot(html)
     soup = BeautifulSoup(html, "html.parser")
 
-    nu = datetime.now()
+    nu = datetime.now(TZ)
     data = {
         "tjek_tidspunkt": nu.strftime("%Y-%m-%d %H:%M"),
         "ugedag": UGEDAGE_DA.get(nu.strftime("%A"), nu.strftime("%A")),
