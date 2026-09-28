@@ -16,9 +16,10 @@ Afhængigheder:
 """
 
 import csv
+import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -213,9 +214,34 @@ def gem_i_log(data: dict) -> None:
         writer.writerow(data)
 
 
+def skal_springe_over(nu: datetime, forrige: dict | None) -> bool:
+    """
+    Onsdags-tjekket er kun en sikkerhedsnet, hvis su.dk var forsinket.
+    Hvis tirsdagens tjek (i går) allerede viste en ændring, springer vi
+    onsdagens over. Kan tvinges med miljøvariablen SU_FORCE=1
+    (bruges når du manuelt trykker "Run workflow").
+    """
+    if os.environ.get("SU_FORCE"):
+        return False
+    if nu.strftime("%A") != "Wednesday" or not forrige:
+        return False
+    try:
+        sidste = datetime.strptime(forrige["tjek_tidspunkt"], "%Y-%m-%d %H:%M").date()
+    except (KeyError, ValueError):
+        return False
+    return (
+        sidste == (nu - timedelta(days=1)).date()
+        and forrige.get("aendret_siden_sidste_tjek") == "Ja"
+    )
+
+
 def main():
     # Læs seneste linje FØR vi tilføjer en ny, så vi kan sammenligne
     forrige = hent_seneste_logrow()
+
+    if skal_springe_over(datetime.now(TZ), forrige):
+        print("Tirsdagens tjek viste allerede en ændring – springer onsdagens tjek over.")
+        return
 
     try:
         data = hent_data()
