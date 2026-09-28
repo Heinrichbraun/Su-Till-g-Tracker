@@ -1,5 +1,6 @@
 """
 Streamlit-app der viser data fra su_status_log.csv.
+Fokus: Videregående uddannelser – hvornår ændrer tallene sig, og hvor mange dage rykker de?
 
 Kør lokalt:   streamlit run app.py
 Gratis hosting: Streamlit Community Cloud (se README).
@@ -19,11 +20,10 @@ MAANEDER = {
     "juli": 7, "august": 8, "september": 9, "oktober": 10, "november": 11, "december": 12,
 }
 
-DATO_FELTER = {
-    "behandlet_til_videregaende": "Behandlet til – Videregående uddannelser",
-    "behandlet_til_erhverv": "Behandlet til – Erhvervsuddannelser",
-    "yderligere_oplysninger_videregaende": "Ældste afventende sag – Videregående",
-    "yderligere_oplysninger_erhverv": "Ældste afventende sag – Erhvervsuddannelser",
+# kolonne i loggen -> (kort titel, titel til kolonne med dage)
+FELTER = {
+    "behandlet_til_videregaende": "Behandlet til",
+    "yderligere_oplysninger_videregaende": "Ældste afventende sag",
 }
 
 
@@ -44,20 +44,42 @@ def parse_dansk_dato(tekst):
         return pd.NaT
 
 
+def fmt_dage(v):
+    """Formatér antal dage som '+7' / '-3' / '0' / '–'."""
+    if pd.isna(v):
+        return "–"
+    v = int(v)
+    return f"+{v}" if v > 0 else str(v)
+
+
 @st.cache_data(ttl=300)
 def load_log():
     if not LOG_FILE.exists():
         return None
     df = pd.read_csv(LOG_FILE, dtype=str).fillna("")
     df["tjek_tidspunkt"] = pd.to_datetime(df["tjek_tidspunkt"], errors="coerce")
-    for kol in DATO_FELTER:
-        if kol in df.columns:
-            df[kol + "_dato"] = df[kol].apply(parse_dansk_dato)
+    df = df.dropna(subset=["tjek_tidspunkt"]).sort_values("tjek_tidspunkt").reset_index(drop=True)
+    for kol in FELTER:
+        df[kol + "_dato"] = df[kol].apply(parse_dansk_dato)
+        # Ændring i dage siden forrige logline
+        df[kol + "_dage"] = df[kol + "_dato"].diff().dt.days
     return df
 
 
+def uge_for_uge(df):
+    """Én linje pr. kalenderuge (seneste tjek i ugen) + antal dage tallene har rykket sig."""
+    iso = df["tjek_tidspunkt"].dt.isocalendar()
+    d = df.assign(uge=iso["year"].astype(str) + "-U" + iso["week"].astype(str).str.zfill(2))
+    uger = d.groupby("uge", sort=True).tail(1).reset_index(drop=True)  # sidste tjek i hver uge
+    out = pd.DataFrame({"Uge": uger["uge"], "Sidst tjekket": uger["tjek_tidspunkt"].dt.strftime("%d-%m-%Y %H:%M")})
+    for kol, titel in FELTER.items():
+        out[titel] = uger[kol]
+        out[f"{titel} – dage rykket"] = uger[kol + "_dato"].diff().dt.days
+    return out
+
+
 st.set_page_config(page_title="SU handicaptillæg – status", page_icon="📊", layout="wide")
-st.title("📊 SU handicaptillæg – status på sagsbehandling")
+st.title("📊 SU handicaptillæg – Videregående uddannelser")
 st.caption("Data hentes automatisk fra su.dk tirsdag aften og onsdag morgen.")
 
 df = load_log()
@@ -66,54 +88,58 @@ if df is None or df.empty:
     st.info("Der er endnu ikke logget nogen data. Kør workflowet på GitHub én gang, og genindlæs siden.")
     st.stop()
 
+ugetabel = uge_for_uge(df)
 seneste = df.iloc[-1]
-forrige = df.iloc[-2] if len(df) > 1 else None
 
-# --- Seneste værdier -------------------------------------------------------
+# --- Seneste tjek ----------------------------------------------------------
 st.subheader("Seneste tjek")
-st.write(f"**{seneste['ugedag']} {seneste['tjek_tidspunkt']:%d-%m-%Y kl. %H:%M}** "
-         f"· su.dk angiver selv: *opdateret {seneste['side_opdateret'] or 'ukendt'}* "
-         f"· ændret siden sidst: **{seneste['aendret_siden_sidste_tjek']}**")
-
-kolonner = st.columns(len(DATO_FELTER))
-for kol, (felt, titel) in zip(kolonner, DATO_FELTER.items()):
-    ny = seneste.get(felt, "")
-    gammel = forrige[felt] if forrige is not None else None
-    delta = None
-    if gammel is not None and gammel != ny:
-        delta = f"før: {gammel}"
-    kol.metric(titel, ny or "–", delta=delta, delta_color="off")
-
-# --- Udvikling over tid ----------------------------------------------------
-st.subheader("Udvikling over tid")
-chart_cols = [k + "_dato" for k in DATO_FELTER if k + "_dato" in df.columns]
-chart_df = df.set_index("tjek_tidspunkt")[chart_cols].dropna(how="all")
-chart_df = chart_df.rename(columns={k + "_dato": v for k, v in DATO_FELTER.items()})
-if chart_df.notna().any().any():
-    # Y-aksen er selve datoen (vist som tal); tabellen nedenfor viser de læsbare datoer
-    st.line_chart(chart_df.apply(lambda s: s.map(lambda d: d.toordinal() if pd.notna(d) else None)))
-    st.caption("Y-aksen er en løbende dagstæller: jo højere op, jo nyere dato er sagsbehandlingen nået til.")
-else:
-    st.write("Ikke nok læsbare datoer til at tegne en graf endnu.")
-
-# --- Ændringer -------------------------------------------------------------
-st.subheader("Tidspunkter hvor noget ændrede sig")
-aendringer = df[df["aendret_siden_sidste_tjek"].isin(["Ja", "Ukendt (første kørsel)"])]
-st.dataframe(
-    aendringer.drop(columns=[c for c in df.columns if c.endswith("_dato")]).sort_values("tjek_tidspunkt", ascending=False),
-    use_container_width=True, hide_index=True,
+st.write(
+    f"**{seneste['ugedag']} {seneste['tjek_tidspunkt']:%d-%m-%Y kl. %H:%M}** "
+    f"· su.dk angiver selv: *opdateret {seneste['side_opdateret'] or 'ukendt'}* "
+    f"· ændret siden sidst: **{seneste['aendret_siden_sidste_tjek']}**"
 )
 
+kol1, kol2 = st.columns(2)
+for kol, (felt, titel) in zip((kol1, kol2), FELTER.items()):
+    delta = None
+    if len(ugetabel) > 1:
+        v = ugetabel[f"{titel} – dage rykket"].iloc[-1]
+        if pd.notna(v):
+            delta = f"{fmt_dage(v)} dage siden forrige uge"
+    kol.metric(titel, seneste[felt] or "–", delta=delta)
+
+# --- Uge for uge -----------------------------------------------------------
+st.subheader("Uge for uge – hvor mange dage har de rykket sig?")
+vis = ugetabel.copy()
+for kol in [c for c in vis.columns if c.endswith("dage rykket")]:
+    vis[kol] = vis[kol].map(fmt_dage)
+st.dataframe(vis.sort_values("Uge", ascending=False), use_container_width=True, hide_index=True)
+st.caption("Positivt tal = sagsbehandlingen er rykket frem. Første uge har ingen sammenligning.")
+
+# --- Tidspunkter hvor noget ændrede sig ------------------------------------
+st.subheader("Tidspunkter hvor noget ændrede sig")
+maske = df["aendret_siden_sidste_tjek"].isin(["Ja", "Ukendt (første kørsel)"])
+aendringer = pd.DataFrame({
+    "Tidspunkt": df["tjek_tidspunkt"].dt.strftime("%d-%m-%Y %H:%M"),
+    "Ugedag": df["ugedag"],
+})
+for kol, titel in FELTER.items():
+    aendringer[titel] = df[kol]
+    aendringer[f"{titel} – dage rykket"] = df[kol + "_dage"].map(fmt_dage)
+aendringer = aendringer[maske].iloc[::-1]
+if aendringer.empty:
+    st.write("Ingen ændringer registreret endnu.")
+else:
+    st.dataframe(aendringer, use_container_width=True, hide_index=True)
+
 # --- Hele loggen -----------------------------------------------------------
-with st.expander("Hele loggen"):
-    st.dataframe(
-        df.drop(columns=[c for c in df.columns if c.endswith("_dato")]).sort_values("tjek_tidspunkt", ascending=False),
-        use_container_width=True, hide_index=True,
-    )
+with st.expander("Hele loggen (alle tjek)"):
+    raa = df.drop(columns=[c for c in df.columns if c.endswith("_dato") or c.endswith("_dage")])
+    st.dataframe(raa.iloc[::-1], use_container_width=True, hide_index=True)
     st.download_button("Download CSV", LOG_FILE.read_bytes(), file_name="su_status_log.csv", mime="text/csv")
 
 # --- Advarsel hvis felter mangler ------------------------------------------
-tomme = [f for f in DATO_FELTER if seneste.get(f, "") == ""]
+tomme = [f for f in FELTER if seneste.get(f, "") == ""]
 if tomme:
     st.warning(
         "Seneste kørsel kunne ikke læse: " + ", ".join(tomme) +
