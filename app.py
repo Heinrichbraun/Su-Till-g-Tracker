@@ -52,8 +52,21 @@ def fmt_dage(v):
     return f"+{v}" if v > 0 else str(v)
 
 
-@st.cache_data(ttl=300)
-def load_log():
+def fmt_tempo(v):
+    """Ændring i tempo: hvor mange dage mere/mindre de rykkede end ugen før."""
+    if pd.isna(v):
+        return "–"
+    v = int(v)
+    if v > 0:
+        return f"▲ hurtigere (+{v})"
+    if v < 0:
+        return f"▼ langsommere ({v})"
+    return "＝ samme tempo"
+
+
+@st.cache_data(ttl=60)
+def load_log(filstempel):
+    """filstempel (filens ændringstid) gør, at cachen ugyldiggøres når loggen ændres."""
     if not LOG_FILE.exists():
         return None
     df = pd.read_csv(LOG_FILE, dtype=str).fillna("")
@@ -74,7 +87,10 @@ def uge_for_uge(df):
     out = pd.DataFrame({"Uge": uger["uge"], "Sidst tjekket": uger["tjek_tidspunkt"].dt.strftime("%d-%m-%Y %H:%M")})
     for kol, titel in FELTER.items():
         out[titel] = uger[kol]
-        out[f"{titel} – dage rykket"] = uger[kol + "_dato"].diff().dt.days
+        dage = uger[kol + "_dato"].diff().dt.days
+        out[f"{titel} – dage rykket"] = dage
+        out[f"{titel} – tempo vs. forrige uge"] = dage.diff()
+        out[f"{titel} – gns. seneste 4 uger"] = dage.rolling(4, min_periods=1).mean().round(1)
     return out
 
 
@@ -82,12 +98,13 @@ st.set_page_config(page_title="SU handicaptillæg – status", page_icon="📊",
 st.title("📊 SU handicaptillæg – Videregående uddannelser")
 st.caption("Data hentes automatisk fra su.dk tirsdag aften og onsdag morgen.")
 
-df = load_log()
+df = load_log(LOG_FILE.stat().st_mtime if LOG_FILE.exists() else 0)
 
 if df is None or df.empty:
     st.info("Der er endnu ikke logget nogen data. Kør workflowet på GitHub én gang, og genindlæs siden.")
     st.stop()
 
+st.caption(f"Loggen indeholder {len(df)} tjek. Seneste linje: {df['tjek_tidspunkt'].iloc[-1]:%d-%m-%Y %H:%M}.")
 ugetabel = uge_for_uge(df)
 seneste = df.iloc[-1]
 
@@ -110,11 +127,33 @@ for kol, (felt, titel) in zip((kol1, kol2), FELTER.items()):
 
 # --- Uge for uge -----------------------------------------------------------
 st.subheader("Uge for uge – hvor mange dage har de rykket sig?")
-vis = ugetabel.copy()
-for kol in [c for c in vis.columns if c.endswith("dage rykket")]:
-    vis[kol] = vis[kol].map(fmt_dage)
-st.dataframe(vis.sort_values("Uge", ascending=False), use_container_width=True, hide_index=True)
-st.caption("Positivt tal = sagsbehandlingen er rykket frem. Første uge har ingen sammenligning.")
+fane_tabel, fane_graf = st.tabs(["Tabel", "Graf"])
+
+with fane_tabel:
+    vis = ugetabel.copy()
+    for kol in [c for c in vis.columns if c.endswith("dage rykket")]:
+        vis[kol] = vis[kol].map(fmt_dage)
+    for kol in [c for c in vis.columns if "tempo vs." in c]:
+        vis[kol] = vis[kol].map(fmt_tempo)
+    for kol in [c for c in vis.columns if "gns." in c]:
+        vis[kol] = vis[kol].map(lambda v: "–" if pd.isna(v) else f"{v:.1f}".replace(".", ","))
+    st.dataframe(vis.sort_values("Uge", ascending=False), use_container_width=True, hide_index=True)
+    st.caption(
+        "Dage rykket: positivt tal = sagsbehandlingen er rykket frem. "
+        "Tempo: ▲ = rykkede flere dage end ugen før, ▼ = færre dage. "
+        "Første uge har ingen sammenligning, og tempo vises først fra tredje uge. "
+        "Hvis en uge mangler i loggen, dækker tallet to uger."
+    )
+
+with fane_graf:
+    graf = ugetabel.set_index("Uge")[[f"{t} – dage rykket" for t in FELTER.values()]]
+    graf.columns = list(FELTER.values())
+    graf = graf.dropna(how="all")
+    if graf.empty:
+        st.write("Der skal være mindst to uger i loggen, før grafen kan vises.")
+    else:
+        st.bar_chart(graf)
+        st.caption("Højere søjle = de rykkede flere dage den uge.")
 
 # --- Tidspunkter hvor noget ændrede sig ------------------------------------
 st.subheader("Tidspunkter hvor noget ændrede sig")
