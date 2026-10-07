@@ -206,6 +206,7 @@ def tjek_aendring(data: dict, forrige: dict | None) -> str:
 
 
 def gem_i_log(data: dict) -> None:
+    """Tilføjer en helt ny linje nederst i loggen."""
     fil_findes = LOG_FILE.exists()
     with LOG_FILE.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
@@ -214,34 +215,67 @@ def gem_i_log(data: dict) -> None:
         writer.writerow(data)
 
 
-def skal_springe_over(nu: datetime, forrige: dict | None) -> bool:
+def erstat_seneste_linje(data: dict) -> None:
     """
-    Onsdags-tjekket er kun en sikkerhedsnet, hvis su.dk var forsinket.
-    Hvis tirsdagens tjek (i går) allerede viste en ændring, springer vi
-    onsdagens over. Kan tvinges med miljøvariablen SU_FORCE=1
-    (bruges når du manuelt trykker "Run workflow").
+    Erstatter den seneste linje i loggen med data, i stedet for at tilføje
+    en ny. Bruges når onsdagens opfølgningstjek viser en (sen) opdatering,
+    så ugen kun får én linje i loggen med de endelige tal.
     """
-    if os.environ.get("SU_FORCE"):
-        return False
-    if nu.strftime("%A") != "Wednesday" or not forrige:
+    rows = []
+    if LOG_FILE.exists():
+        with LOG_FILE.open("r", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    if rows:
+        rows[-1] = data
+    else:
+        rows = [data]
+    with LOG_FILE.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _forrige_var_i_gaar(nu: datetime, forrige: dict | None) -> bool:
+    """Var den seneste logline fra i går (set fra 'nu')?"""
+    if not forrige:
         return False
     try:
         sidste = datetime.strptime(forrige["tjek_tidspunkt"], "%Y-%m-%d %H:%M").date()
     except (KeyError, ValueError):
         return False
-    return (
-        sidste == (nu - timedelta(days=1)).date()
-        and forrige.get("aendret_siden_sidste_tjek") == "Ja"
-    )
+    return sidste == (nu - timedelta(days=1)).date()
+
+
+def skal_springe_over(nu: datetime, forrige: dict | None) -> bool:
+    """
+    Onsdags-tjekket er kun et sikkerhedsnet, hvis su.dk var forsinket
+    tirsdag. Hvis tirsdagens tjek (i går) allerede viste en ændring,
+    springer vi onsdagens helt over. Kan tvinges igennem med
+    miljøvariablen SU_FORCE=1 (bruges når du manuelt trykker
+    "Run workflow", så du altid kan teste).
+    """
+    if os.environ.get("SU_FORCE"):
+        return False
+    if nu.strftime("%A") != "Wednesday":
+        return False
+    return _forrige_var_i_gaar(nu, forrige) and forrige.get("aendret_siden_sidste_tjek") == "Ja"
 
 
 def main():
-    # Læs seneste linje FØR vi tilføjer en ny, så vi kan sammenligne
+    nu = datetime.now(TZ)
+
+    # Læs seneste linje FØR vi tilføjer/erstatter noget, så vi kan sammenligne
     forrige = hent_seneste_logrow()
 
-    if skal_springe_over(datetime.now(TZ), forrige):
+    if skal_springe_over(nu, forrige):
         print("Tirsdagens tjek viste allerede en ændring – springer onsdagens tjek over.")
         return
+
+    # Er dette onsdagens opfølgning på gårsdagens (tirsdagens) tjek? Så skal
+    # resultatet IKKE give en ny linje i loggen, men enten droppes (hvis
+    # stadig uændret) eller erstatte tirsdagens linje (hvis det nu er
+    # opdateret) — der skal kun stå én linje pr. uge i loggen.
+    er_opfolgning = nu.strftime("%A") == "Wednesday" and _forrige_var_i_gaar(nu, forrige)
 
     try:
         data = hent_data()
@@ -259,31 +293,47 @@ def main():
 
     data["aendret_siden_sidste_tjek"] = tjek_aendring(data, forrige)
 
-    gem_i_log(data)
-    print(f"Logget kl. {data['tjek_tidspunkt']} ({data['ugedag']}):")
+    print(f"Tjekket kl. {data['tjek_tidspunkt']} ({data['ugedag']}):")
     for k in [*SCRAPE_FIELDS, "aendret_siden_sidste_tjek"]:
         print(f"  {k}: {data[k]}")
 
-    if data["ugedag"] == "Tirsdag" and data["aendret_siden_sidste_tjek"] == "Nej":
+    if er_opfolgning and data["aendret_siden_sidste_tjek"] == "Nej":
+        # Stadig uændret onsdag morgen: dropper tjekket, så vi ikke får to
+        # linjer for samme uge. Snapshottet er allerede gemt ovenfor.
         print(
-            "\nBemærk: Siden er IKKE ændret siden sidste tjek. Da su.dk "
-            "normalt opdaterer om tirsdagen, kan de være forsinkede — "
-            "onsdagens tjek vil afklare det."
+            "\nBemærk: Siden er STADIG ikke ændret onsdag morgen. Logger "
+            "IKKE en ekstra linje for ugen — tirsdagens linje står ved magt."
         )
-    elif data["ugedag"] == "Onsdag" and data["aendret_siden_sidste_tjek"] == "Ja":
+        print(f"Snapshot gemt i: {SNAPSHOT_DIR}")
+        if manglende:
+            sys.exit(1)
+        return
+
+    if er_opfolgning and data["aendret_siden_sidste_tjek"] == "Ja":
+        # Opdateringen kom (sent) onsdag: erstat tirsdagens linje, så ugen
+        # stadig kun har én linje i loggen, nu med de endelige tal.
+        erstat_seneste_linje(data)
         print(
             "\nBemærk: Siden er ændret siden i går (tirsdag) — su.dk var "
-            "altså forsinkede med ugens opdatering, men den er nu faldet på plads."
+            "altså forsinkede med ugens opdatering. Tirsdagens linje i "
+            "loggen er erstattet med onsdagens (endelige) tal."
         )
-    elif data["ugedag"] == "Onsdag" and data["aendret_siden_sidste_tjek"] == "Nej":
-        print(
-            "\nBemærk: Siden er STADIG ikke ændret onsdag morgen. "
-            "Ugens opdatering er enten ikke kommet endnu, eller også er "
-            "der reelt ingen ændring i tallene denne uge."
-        )
+    else:
+        gem_i_log(data)
+        if data["ugedag"] == "Tirsdag" and data["aendret_siden_sidste_tjek"] == "Nej":
+            print(
+                "\nBemærk: Siden er IKKE ændret siden sidste tjek. Da su.dk "
+                "normalt opdaterer om tirsdagen, kan de være forsinkede — "
+                "onsdagens tjek vil afklare det."
+            )
 
     print(f"\nGemt i: {LOG_FILE}")
     print(f"Snapshot gemt i: {SNAPSHOT_DIR}")
+
+    # Giv GitHub en fejlkode, hvis felter manglede, så du får en mail.
+    # (Loggen og snapshottet er allerede gemt ovenfor.)
+    if manglende:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
