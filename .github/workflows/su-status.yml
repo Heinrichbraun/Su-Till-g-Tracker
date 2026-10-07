@@ -30,9 +30,21 @@ jobs:
         env:
           # Ved manuel kørsel ("Run workflow") tvinges tjekket igennem
           SU_FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+          # Fortæller scriptet hvilken af de to planlagte kørsler dette ER,
+          # uafhængigt af det faktiske klokkeslæt. Nødvendigt fordi GitHub
+          # nogle gange forsinker en kørsel så meget, at den krydser midnat
+          # dansk tid — uden dette ville scriptet fejlagtigt tro, at en
+          # forsinket tirsdags-kørsel var onsdagens tjek.
+          SU_SCHEDULED_DAY: >-
+            ${{
+              github.event.schedule == '0 18 * * 2' && 'Tirsdag' ||
+              github.event.schedule == '0 6 * * 3' && 'Onsdag' ||
+              ''
+            }}
         run: python su_status_tracker.py
 
       - name: Gem log og snapshots i repoet
+        if: always()   # gem også når scriptet fejler, så snapshottet ikke går tabt
         run: |
           git config user.name "su-status-bot"
           git config user.email "actions@users.noreply.github.com"
