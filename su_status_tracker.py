@@ -19,7 +19,7 @@ import csv
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -51,10 +51,13 @@ SCRAPE_FIELDS = [
 
 # Kolonneoverskrifter i loggen
 FIELDNAMES = [
-    "tjek_tidspunkt",              # hvornår scriptet blev kørt
-    "ugedag",                      # Tirsdag / Onsdag / osv.
+    "tjek_tidspunkt",              # hvornår scriptet rent faktisk kørte (kan være forsinket af GitHub)
+    "ugedag",                      # Tirsdag / Onsdag / Manuel — se bestem_tjek_type()
+    "tjek_type",                   # Tirsdag / Onsdag / Manuel — det SAMME som ugedag, men er den
+                                    # værdi logikken bruger til at afgøre opfølgning. Holdes adskilt
+                                    # fra det faktiske klokkeslæt, som kan være upålideligt pga. forsinkelser.
     *SCRAPE_FIELDS,
-    "aendret_siden_sidste_tjek",   # Ja / Nej / Ukendt (første kørsel) — sammenlignet med forrige logline
+    "aendret_siden_sidste_tjek",   # Ja / Nej / Ukendt (første kørsel) / Ukendt (fejl i hentning)
 ]
 
 UGEDAGE_DA = {
@@ -139,15 +142,44 @@ def gem_snapshot(html: str) -> Path:
     return sti
 
 
+def bestem_tjek_type(nu: datetime) -> str:
+    """
+    Afgør om dette er "Tirsdag"-tjekket, "Onsdag"-tjekket eller en manuel
+    kørsel — styret af miljøvariablen SU_SCHEDULED_DAY, som workflowet
+    sætter ud fra HVILKEN cron-linje der udløste kørslen (GitHubs
+    github.event.schedule), IKKE ud fra det faktiske klokkeslæt.
+
+    Det er vigtigt: GitHub kan forsinke en planlagt kørsel med flere timer.
+    Hvis tirsdagens kørsel (planlagt kl. 20:00) bliver forsinket til lige
+    efter midnat, er det stadig tirsdagens tjek, selvom uret så siger
+    onsdag. Ville vi bestemme det ud fra uret alene, ville den fejlagtigt
+    blive opfattet som onsdagens tjek, og "onsdagens rigtige tjek" ville
+    senere på dagen fejlagtigt oprette en ekstra, ikke-relateret linje.
+
+    Falder tilbage til det faktiske ugedagsnavn, hvis variablen ikke er
+    sat (fx når du kører scriptet lokalt eller trykker "Run workflow").
+    """
+    fra_workflow = os.environ.get("SU_SCHEDULED_DAY", "").strip()
+    if fra_workflow in ("Tirsdag", "Onsdag"):
+        return fra_workflow
+    if os.environ.get("GITHUB_ACTIONS"):
+        # Kørte i GitHub Actions, men ikke via en af de to kendte cron-linjer
+        # (fx "Run workflow" manuelt) — behandl som en engangskørsel.
+        return "Manuel"
+    return UGEDAGE_DA.get(nu.strftime("%A"), nu.strftime("%A"))
+
+
 def hent_data() -> dict:
     html = hent_html(URL)
     gem_snapshot(html)
     soup = BeautifulSoup(html, "html.parser")
 
     nu = datetime.now(TZ)
+    tjek_type = bestem_tjek_type(nu)
     data = {
         "tjek_tidspunkt": nu.strftime("%Y-%m-%d %H:%M"),
-        "ugedag": UGEDAGE_DA.get(nu.strftime("%A"), nu.strftime("%A")),
+        "ugedag": tjek_type,
+        "tjek_type": tjek_type,
         "side_opdateret": find_opdateret_dato(soup),
         "behandlet_til_videregaende": find_table_value(soup, "Videregående uddannelser"),
         "behandlet_til_erhverv": find_table_value(soup, "Erhvervsuddannelser"),
@@ -205,6 +237,29 @@ def tjek_aendring(data: dict, forrige: dict | None) -> str:
     return "Ja" if aendret else "Nej"
 
 
+def migrer_log_header() -> None:
+    """
+    Sikrer at loggens kolonner matcher den nuværende FIELDNAMES-liste.
+    Scriptet har fået nye kolonner undervejs (fx tjek_type); uden denne
+    migrering ville nye linjer blive skrevet med flere felter end den
+    gamle overskriftsrække har, så kolonnerne forskydes i Excel/Streamlit.
+    Gamle rækker bevares, nye kolonner udfyldes tomme for dem.
+    """
+    if not LOG_FILE.exists():
+        return
+    with LOG_FILE.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        eksisterende = reader.fieldnames or []
+        rows = list(reader)
+    if eksisterende == FIELDNAMES:
+        return
+    with LOG_FILE.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in FIELDNAMES})
+
+
 def gem_i_log(data: dict) -> None:
     """Tilføjer en helt ny linje nederst i loggen."""
     fil_findes = LOG_FILE.exists()
@@ -235,47 +290,41 @@ def erstat_seneste_linje(data: dict) -> None:
         writer.writerows(rows)
 
 
-def _forrige_var_i_gaar(nu: datetime, forrige: dict | None) -> bool:
-    """Var den seneste logline fra i går (set fra 'nu')?"""
-    if not forrige:
-        return False
-    try:
-        sidste = datetime.strptime(forrige["tjek_tidspunkt"], "%Y-%m-%d %H:%M").date()
-    except (KeyError, ValueError):
-        return False
-    return sidste == (nu - timedelta(days=1)).date()
-
-
-def skal_springe_over(nu: datetime, forrige: dict | None) -> bool:
+def skal_springe_over(tjek_type: str, forrige: dict | None) -> bool:
     """
     Onsdags-tjekket er kun et sikkerhedsnet, hvis su.dk var forsinket
-    tirsdag. Hvis tirsdagens tjek (i går) allerede viste en ændring,
-    springer vi onsdagens helt over. Kan tvinges igennem med
-    miljøvariablen SU_FORCE=1 (bruges når du manuelt trykker
-    "Run workflow", så du altid kan teste).
+    tirsdag. Hvis tirsdagens tjek allerede viste en ændring, springer vi
+    onsdagens helt over. Baseret på tjek_type (se bestem_tjek_type), IKKE
+    på kalenderdatoer — så en forsinket kørsel, der krydser midnat, giver
+    ikke forkert resultat. Kan tvinges igennem med miljøvariablen
+    SU_FORCE=1 (bruges når du manuelt trykker "Run workflow", så du altid
+    kan teste).
     """
     if os.environ.get("SU_FORCE"):
         return False
-    if nu.strftime("%A") != "Wednesday":
+    if tjek_type != "Onsdag" or not forrige:
         return False
-    return _forrige_var_i_gaar(nu, forrige) and forrige.get("aendret_siden_sidste_tjek") == "Ja"
+    return forrige.get("tjek_type") == "Tirsdag" and forrige.get("aendret_siden_sidste_tjek") == "Ja"
 
 
 def main():
     nu = datetime.now(TZ)
+    tjek_type_nu = bestem_tjek_type(nu)
+
+    # Sørg for at en ældre logfil har de nyeste kolonner, FØR vi læser/skriver
+    migrer_log_header()
 
     # Læs seneste linje FØR vi tilføjer/erstatter noget, så vi kan sammenligne
     forrige = hent_seneste_logrow()
 
-    if skal_springe_over(nu, forrige):
+    if skal_springe_over(tjek_type_nu, forrige):
         print("Tirsdagens tjek viste allerede en ændring – springer onsdagens tjek over.")
         return
 
-    # Er dette onsdagens opfølgning på gårsdagens (tirsdagens) tjek? Så skal
-    # resultatet IKKE give en ny linje i loggen, men enten droppes (hvis
-    # stadig uændret) eller erstatte tirsdagens linje (hvis det nu er
-    # opdateret) — der skal kun stå én linje pr. uge i loggen.
-    er_opfolgning = nu.strftime("%A") == "Wednesday" and _forrige_var_i_gaar(nu, forrige)
+    # Er dette onsdagens opfølgning på tirsdagens tjek? Baseret på tjek_type,
+    # ikke kalenderdatoer, så en forsinket kørsel der krydser midnat ikke
+    # fejlagtigt bliver opfattet som en ny, urelateret uge.
+    er_opfolgning = tjek_type_nu == "Onsdag" and forrige is not None and forrige.get("tjek_type") == "Tirsdag"
 
     try:
         data = hent_data()
@@ -287,13 +336,17 @@ def main():
     if manglende:
         print(
             "Advarsel: kunne ikke finde værdi for: " + ", ".join(manglende) +
-            " — su.dk kan have ændret sidens opbygning.",
+            " — su.dk kan have ændret sidens opbygning, eller siden svarede ikke korrekt denne gang.",
             file=sys.stderr,
         )
+        # Manglende felter gør sammenligningen upålidelig (et tomt felt vil
+        # altid se ud som "ændret"). Marker det derfor som ukendt i stedet
+        # for at risikere en falsk "Ja"/"Nej".
+        data["aendret_siden_sidste_tjek"] = "Ukendt (fejl i hentning)"
+    else:
+        data["aendret_siden_sidste_tjek"] = tjek_aendring(data, forrige)
 
-    data["aendret_siden_sidste_tjek"] = tjek_aendring(data, forrige)
-
-    print(f"Tjekket kl. {data['tjek_tidspunkt']} ({data['ugedag']}):")
+    print(f"Tjekket kl. {data['tjek_tidspunkt']} ({data['ugedag']}, tjek_type={data['tjek_type']}):")
     for k in [*SCRAPE_FIELDS, "aendret_siden_sidste_tjek"]:
         print(f"  {k}: {data[k]}")
 
@@ -314,13 +367,13 @@ def main():
         # stadig kun har én linje i loggen, nu med de endelige tal.
         erstat_seneste_linje(data)
         print(
-            "\nBemærk: Siden er ændret siden i går (tirsdag) — su.dk var "
+            "\nBemærk: Siden er ændret siden tirsdagens tjek — su.dk var "
             "altså forsinkede med ugens opdatering. Tirsdagens linje i "
             "loggen er erstattet med onsdagens (endelige) tal."
         )
     else:
         gem_i_log(data)
-        if data["ugedag"] == "Tirsdag" and data["aendret_siden_sidste_tjek"] == "Nej":
+        if data["tjek_type"] == "Tirsdag" and data["aendret_siden_sidste_tjek"] == "Nej":
             print(
                 "\nBemærk: Siden er IKKE ændret siden sidste tjek. Da su.dk "
                 "normalt opdaterer om tirsdagen, kan de være forsinkede — "
