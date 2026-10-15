@@ -49,5 +49,12 @@ jobs:
           git config user.name "su-status-bot"
           git config user.email "actions@users.noreply.github.com"
           git add su_status_log.csv snapshots/
-          git commit -m "Opdater su-status log $(date -u +%Y-%m-%d_%H:%M)" || echo "Ingen ændringer at gemme"
+          if git diff --cached --quiet; then
+            echo "Ingen ændringer at gemme"
+            exit 0
+          fi
+          git commit -m "Opdater su-status log $(date -u +%Y-%m-%d_%H:%M)"
+          # Hent evt. nye commits (fx filer du har uploadet, mens kørslen
+          # stod i kø), så push ikke bliver afvist
+          git pull --rebase
           git push
