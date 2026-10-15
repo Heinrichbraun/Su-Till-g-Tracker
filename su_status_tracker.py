@@ -77,7 +77,11 @@ def hent_html(url: str) -> str:
     }
     resp = requests.get(url, headers=headers, timeout=20)
     resp.raise_for_status()
-    return resp.text
+    # su.dk sender ikke altid tegnsættet med i svaret. Så gætter requests på
+    # ISO-8859-1, og "på" bliver til "pÃ¥" — hvorefter overskriften med
+    # "opdateret"-datoen ikke kan findes. Siden er altid UTF-8, så vi
+    # afkoder selv de rå bytes.
+    return resp.content.decode("utf-8", errors="replace")
 
 
 def find_table_value(soup: BeautifulSoup, row_label: str) -> str:
@@ -98,12 +102,15 @@ def find_opdateret_dato(soup: BeautifulSoup) -> str:
     """
     Finder teksten i overskriften "Status på sagsbehandlingen - opdateret DD. måned ÅÅÅÅ"
     """
-    heading = soup.find(string=re.compile(r"Status på sagsbehandlingen", re.IGNORECASE))
-    if heading:
-        m = re.search(r"opdateret\s+(.+)", heading, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return ""
+    # Søger i hele sidens tekst og fanger kun selve datoen, så det ikke
+    # afhænger af, præcis hvilket tag overskriften står i.
+    tekst = soup.get_text(" ", strip=True)
+    m = re.search(
+        r"sagsbehandlingen\s*[-–]\s*opdateret\s+(\d{1,2}\.\s*[A-Za-zæøåÆØÅ]+\s+\d{4})",
+        tekst,
+        re.IGNORECASE,
+    )
+    return m.group(1).strip() if m else ""
 
 
 def find_klagesager(soup: BeautifulSoup) -> str:
@@ -220,6 +227,31 @@ def hent_seneste_logrow() -> dict | None:
     return rows[-1] if rows else None
 
 
+def er_gyldig(row: dict | None) -> bool:
+    """True hvis linjen blev hentet korrekt (alle indholdsfelter udfyldt)."""
+    return bool(row) and all(row.get(felt) for felt in SCRAPE_FIELDS) and (
+        row.get("aendret_siden_sidste_tjek") != "Ukendt (fejl i hentning)"
+    )
+
+
+def hent_seneste_gyldige_logrow() -> dict | None:
+    """
+    Seneste linje i loggen, hvor hentningen lykkedes. Det er DENNE, vi skal
+    sammenligne med — ikke blot den seneste linje. Ellers ser en fejlet
+    hentning (tomt felt) ud som en "ændring" ved næste tjek, onsdagens
+    sikkerhedsnet springes fejlagtigt over, og ugens rigtige opdatering
+    går tabt. (Det skete uge 42 i 2026.)
+    """
+    if not LOG_FILE.exists():
+        return None
+    with LOG_FILE.open("r", newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    for row in reversed(rows):
+        if er_gyldig(row):
+            return row
+    return None
+
+
 def tjek_aendring(data: dict, forrige: dict | None) -> str:
     """
     Sammenligner de faktiske indholdsfelter (SCRAPE_FIELDS) med den seneste
@@ -314,8 +346,11 @@ def main():
     # Sørg for at en ældre logfil har de nyeste kolonner, FØR vi læser/skriver
     migrer_log_header()
 
-    # Læs seneste linje FØR vi tilføjer/erstatter noget, så vi kan sammenligne
+    # Læs seneste linje FØR vi tilføjer/erstatter noget. "forrige" bruges til
+    # at afgøre tirsdag/onsdag-forløbet; "sammenlign_med" er den seneste
+    # linje, der blev hentet korrekt, og er den, vi måler ændringer imod.
     forrige = hent_seneste_logrow()
+    sammenlign_med = hent_seneste_gyldige_logrow()
 
     if skal_springe_over(tjek_type_nu, forrige):
         print("Tirsdagens tjek viste allerede en ændring – springer onsdagens tjek over.")
@@ -344,11 +379,26 @@ def main():
         # for at risikere en falsk "Ja"/"Nej".
         data["aendret_siden_sidste_tjek"] = "Ukendt (fejl i hentning)"
     else:
-        data["aendret_siden_sidste_tjek"] = tjek_aendring(data, forrige)
+        data["aendret_siden_sidste_tjek"] = tjek_aendring(data, sammenlign_med)
 
     print(f"Tjekket kl. {data['tjek_tidspunkt']} ({data['ugedag']}, tjek_type={data['tjek_type']}):")
     for k in [*SCRAPE_FIELDS, "aendret_siden_sidste_tjek"]:
         print(f"  {k}: {data[k]}")
+
+    if er_opfolgning and manglende:
+        # Onsdagens hentning fejlede: rør ikke loggen, så ugen ikke får en
+        # ekstra (fejlet) linje. Tirsdagens linje står ved magt.
+        print("\nOnsdagens hentning fejlede — loggen er ikke ændret.", file=sys.stderr)
+        print(f"Snapshot gemt i: {SNAPSHOT_DIR}")
+        sys.exit(1)
+
+    if er_opfolgning and data["aendret_siden_sidste_tjek"] == "Nej" and not er_gyldig(forrige):
+        # Tirsdagens hentning fejlede, men onsdagens lykkedes: erstat den
+        # fejlede linje med onsdagens korrekte (uændrede) tal.
+        erstat_seneste_linje(data)
+        print("\nBemærk: Tirsdagens hentning fejlede — linjen er erstattet med onsdagens tal.")
+        print(f"\nGemt i: {LOG_FILE}")
+        return
 
     if er_opfolgning and data["aendret_siden_sidste_tjek"] == "Nej":
         # Stadig uændret onsdag morgen: dropper tjekket, så vi ikke får to
