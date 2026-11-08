@@ -27,11 +27,13 @@ MAANEDER = {
 }
 MAANEDSNAVNE = {nr: navn for navn, nr in MAANEDER.items()}
 
-# kolonne i loggen -> (kort titel, titel til kolonne med dage)
+# Kun det felt der rammer mig: ansøgninger der kræver yderligere dokumentation.
+# ("behandlet_til_videregaende" bliver stadig logget i CSV-filen, men vises ikke her.)
+# kolonne i loggen -> titel
 FELTER = {
-    "behandlet_til_videregaende": "Behandlet til",
     "yderligere_oplysninger_videregaende": "Ældste afventende sag",
 }
+RELEVANT_FELT = "yderligere_oplysninger_videregaende"
 
 
 def parse_dansk_dato(tekst):
@@ -133,20 +135,27 @@ seneste = df.iloc[-1]
 
 # --- Seneste tjek ----------------------------------------------------------
 st.subheader("Seneste tjek")
+
+# "Ændret siden sidst" ud fra det relevante felt (ikke fra CSV-kolonnen, som også
+# tæller ændringer i felter der ikke vises her)
+if len(df) < 2:
+    relevant_aendret = "Første kørsel"
+else:
+    relevant_aendret = "Ja" if df[RELEVANT_FELT + "_dage"].iloc[-1] != 0 else "Nej"
+
 st.write(
     f"**{seneste['ugedag']} {seneste['tjek_tidspunkt']:%d-%m-%Y kl. %H:%M}** "
     f"· su.dk angiver selv: *opdateret {seneste['side_opdateret'] or 'ukendt'}* "
-    f"· ændret siden sidst: **{seneste['aendret_siden_sidste_tjek']}**"
+    f"· ændret siden sidst: **{relevant_aendret}**"
 )
 
-kol1, kol2 = st.columns(2)
-for kol, (felt, titel) in zip((kol1, kol2), FELTER.items()):
+for felt, titel in FELTER.items():
     delta = None
     if len(ugetabel) > 1:
         v = ugetabel[f"{titel} – dage rykket"].iloc[-1]
         if pd.notna(v):
             delta = f"{fmt_dage(v)} dage siden forrige uge"
-    kol.metric(titel, seneste[felt] or "–", delta=delta)
+    st.metric(titel, seneste[felt] or "–", delta=delta)
 
 # --- Min ansøgning og SU-klip ----------------------------------------------
 st.subheader("Min ansøgning og SU-klip")
@@ -256,7 +265,8 @@ with fane_graf:
 
 # --- Tidspunkter hvor noget ændrede sig ------------------------------------
 st.subheader("Tidspunkter hvor noget ændrede sig")
-maske = df["aendret_siden_sidste_tjek"].isin(["Ja", "Ukendt (første kørsel)"])
+# Kun rækker hvor det relevante felt rykkede sig (plus allerførste række)
+maske = (df[RELEVANT_FELT + "_dage"].fillna(0) != 0) | (df.index == 0)
 aendringer = pd.DataFrame({
     "Tidspunkt": df["tjek_tidspunkt"].dt.strftime("%d-%m-%Y %H:%M"),
     "Ugedag": df["ugedag"],
