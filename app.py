@@ -7,7 +7,9 @@ Gratis hosting: Streamlit Community Cloud (se README).
 """
 
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -15,10 +17,15 @@ import streamlit as st
 LOG_FILE = Path(__file__).resolve().parent / "su_status_log.csv"
 SNAPSHOT_DIR = Path(__file__).resolve().parent / "snapshots"
 
+# --- Personlige datoer (ret her, hvis noget ændrer sig) ---------------------
+MIN_ANSOEGNING = pd.Timestamp(2025, 10, 10)   # datoen din ansøgning blev sendt
+SU_KLIP_SLUT = pd.Timestamp(2027, 6, 1)       # hvornår du løber tør for SU-klip (juni 2027)
+
 MAANEDER = {
     "januar": 1, "februar": 2, "marts": 3, "april": 4, "maj": 5, "juni": 6,
     "juli": 7, "august": 8, "september": 9, "oktober": 10, "november": 11, "december": 12,
 }
+MAANEDSNAVNE = {nr: navn for navn, nr in MAANEDER.items()}
 
 # kolonne i loggen -> (kort titel, titel til kolonne med dage)
 FELTER = {
@@ -42,6 +49,22 @@ def parse_dansk_dato(tekst):
         return pd.Timestamp(int(aar), nr, int(dag))
     except ValueError:
         return pd.NaT
+
+
+def fmt_dato(d):
+    """Timestamp -> '10. oktober 2025'."""
+    return f"{d.day}. {MAANEDSNAVNE[d.month]} {d.year}"
+
+
+def i_dag():
+    """Dagens dato i dansk tid (Streamlit Cloud kører i UTC)."""
+    return pd.Timestamp(datetime.now(ZoneInfo("Europe/Copenhagen")).date())
+
+
+def fmt_varighed(dage):
+    """Antal dage -> '345 dage (ca. 49 uger)'."""
+    dage = int(dage)
+    return f"{dage} dage (ca. {round(dage / 7)} uger)"
 
 
 def fmt_dage(v):
@@ -124,6 +147,82 @@ for kol, (felt, titel) in zip((kol1, kol2), FELTER.items()):
         if pd.notna(v):
             delta = f"{fmt_dage(v)} dage siden forrige uge"
     kol.metric(titel, seneste[felt] or "–", delta=delta)
+
+# --- Min ansøgning og SU-klip ----------------------------------------------
+st.subheader("Min ansøgning og SU-klip")
+idag = i_dag()
+ældste = seneste["yderligere_oplysninger_videregaende_dato"]  # ældste sag der afventer ekstra dokumentation
+
+# Gennemsnitligt tempo (dage rykket pr. uge) over de seneste op til 4 uger
+tempo_serie = ugetabel["Ældste afventende sag – dage rykket"].dropna().tail(4)
+tempo = tempo_serie.mean() if len(tempo_serie) else None
+
+forventet = None
+dage_til_ansoegning = None
+if pd.notna(ældste):
+    dage_til_ansoegning = (MIN_ANSOEGNING - ældste).days
+    if dage_til_ansoegning > 0 and tempo is not None and tempo > 0:
+        forventet = idag + timedelta(days=round(dage_til_ansoegning / tempo * 7))
+
+m1, m2, m3 = st.columns(3)
+
+with m1:
+    if dage_til_ansoegning is None:
+        st.metric("Afstand til din ansøgning", "–")
+        st.caption("Kunne ikke læse datoen for ældste afventende sag.")
+    elif dage_til_ansoegning > 0:
+        st.metric("Afstand til din ansøgning", f"{dage_til_ansoegning} dage")
+        st.caption(
+            f"Ældste sag med ekstra dokumentation: **{fmt_dato(ældste)}**. "
+            f"Din ansøgning: **{fmt_dato(MIN_ANSOEGNING)}**."
+        )
+    else:
+        st.metric("Afstand til din ansøgning", "Nået")
+        st.caption(
+            f"Ældste sag med ekstra dokumentation er nu **{fmt_dato(ældste)}**, "
+            f"altså på eller efter din ansøgningsdato ({fmt_dato(MIN_ANSOEGNING)}). "
+            "Tjek din egen sag hos SU for at se, om den er afgjort."
+        )
+
+with m2:
+    if forventet is not None:
+        st.metric("Groft estimat: ansøgningsdato nået", fmt_dato(forventet))
+        tempo_tekst = f"{tempo:.1f}".replace(".", ",")
+        st.caption(
+            f"Baseret på et gennemsnit på {tempo_tekst} dage pr. uge over de seneste "
+            f"{len(tempo_serie)} uger."
+        )
+    elif dage_til_ansoegning is not None and dage_til_ansoegning <= 0:
+        st.metric("Groft estimat: ansøgningsdato nået", "Allerede nået")
+    else:
+        st.metric("Groft estimat: ansøgningsdato nået", "–")
+        if dage_til_ansoegning is not None:
+            st.caption(
+                "Kan ikke beregnes endnu. Det kræver mindst to uger i loggen, hvor datoen "
+                "har rykket sig fremad."
+            )
+
+with m3:
+    dage_til_klip = (SU_KLIP_SLUT - idag).days
+    if dage_til_klip > 0:
+        st.metric("Nedtælling til SU-klip løber ud", f"{dage_til_klip} dage")
+        st.caption(f"Ca. {round(dage_til_klip / 7)} uger til {fmt_dato(SU_KLIP_SLUT)}.")
+    else:
+        st.metric("Nedtælling til SU-klip løber ud", "Nået")
+        st.caption(f"Datoen {fmt_dato(SU_KLIP_SLUT)} er passeret.")
+
+if forventet is not None:
+    forskel = (SU_KLIP_SLUT - forventet).days
+    if forskel >= 0:
+        st.success(
+            f"På nuværende tempo nås din ansøgningsdato ca. {fmt_varighed(forskel)} "
+            f"**før** {fmt_dato(SU_KLIP_SLUT)}. Det er et groft estimat, tempoet svinger fra uge til uge."
+        )
+    else:
+        st.warning(
+            f"På nuværende tempo nås din ansøgningsdato ca. {fmt_varighed(-forskel)} "
+            f"**efter** {fmt_dato(SU_KLIP_SLUT)}. Det er et groft estimat, tempoet svinger fra uge til uge."
+        )
 
 # --- Uge for uge -----------------------------------------------------------
 st.subheader("Uge for uge – hvor mange dage har de rykket sig?")
